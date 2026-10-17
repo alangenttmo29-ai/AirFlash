@@ -99,13 +99,50 @@ impl PtpMaster {
     pub fn start(peers: Vec<IpAddr>, clock: Clock) -> Result<Self> {
         let event = UdpSocket::bind("0.0.0.0:319").context("PTP event port 319 unavailable")?;
         let general = UdpSocket::bind("0.0.0.0:320").context("PTP general port 320 unavailable")?;
-        event.set_nonblocking(true)?;
         general.set_nonblocking(true)?;
         let clock_id = rand::random::<u64>() & 0x7fff_ffff_ffff_ffff;
         let received = Arc::new(AtomicU64::new(0));
         let rx = received.clone();
+        let allowed = peers.clone();
         let cancel = Cancellation::default();
         let stop = cancel.clone();
+        let (event_tx, general_tx) = (event.try_clone()?, general.try_clone()?);
+        let responder_clock = clock.clone();
+        let respond = move |buf: &[u8], from: IpAddr, received_ns: u64| {
+            let n = buf.len();
+            if !allowed.contains(&from) || n < 34 || buf[1] & 0xf != 2 {
+                return;
+            }
+            let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            if length > n || length < 34 {
+                return;
+            }
+            rx.fetch_add(1, Ordering::Relaxed);
+            let kind = buf[0] & 0xf;
+            let request_seq = u16::from_be_bytes([buf[30], buf[31]]);
+            if (kind == 1 || kind == 2) && n >= 44 {
+                let response_kind = if kind == 1 { 9 } else { 3 };
+                let mut response = header(
+                    response_kind,
+                    54,
+                    clock_id,
+                    request_seq,
+                    if kind == 1 { 0x0408 } else { 0x0608 },
+                    -3,
+                );
+                timestamp(&mut response[34..44], received_ns);
+                response[44..54].copy_from_slice(&buf[20..30]);
+                if kind == 1 {
+                    let _ = general_tx.send_to(&response, (from, 320));
+                } else {
+                    let mut follow = header(10, 54, clock_id, request_seq, 0x0408, -3);
+                    timestamp(&mut follow[34..44], responder_clock.now_ns());
+                    let _ = event_tx.send_to(&response, (from, 319));
+                    follow[44..54].copy_from_slice(&buf[20..30]);
+                    let _ = general_tx.send_to(&follow, (from, 320));
+                }
+            }
+        };
         let worker = thread::Builder::new()
             .name("airplay-ptp".into())
             .spawn(move || {
@@ -133,44 +170,20 @@ impl PtpMaster {
                         seq = seq.wrapping_add(1);
                         next_sync = now + Duration::from_millis(125);
                     }
-                    for socket in [&event, &general] {
-                        while let Ok((n, addr)) = socket.recv_from(&mut buf) {
-                            if !peers.contains(&addr.ip()) || n < 34 || buf[1] & 0xf != 2 {
-                                continue;
-                            }
-                            let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-                            if length > n || length < 34 {
-                                continue;
-                            }
-                            rx.fetch_add(1, Ordering::Relaxed);
-                            let kind = buf[0] & 0xf;
-                            let request_seq = u16::from_be_bytes([buf[30], buf[31]]);
-                            if (kind == 1 || kind == 2) && n >= 44 {
-                                let response_kind = if kind == 1 { 9 } else { 3 };
-                                let mut response = header(
-                                    response_kind,
-                                    54,
-                                    clock_id,
-                                    request_seq,
-                                    if kind == 1 { 0x0408 } else { 0x0608 },
-                                    -3,
-                                );
-                                timestamp(&mut response[34..44], clock.now_ns());
-                                response[44..54].copy_from_slice(&buf[20..30]);
-                                if kind == 1 {
-                                    let _ = general.send_to(&response, (addr.ip(), 320));
-                                } else {
-                                    let _ = event.send_to(&response, (addr.ip(), 319));
-                                    let mut follow =
-                                        header(10, 54, clock_id, request_seq, 0x0408, -3);
-                                    timestamp(&mut follow[34..44], clock.now_ns());
-                                    follow[44..54].copy_from_slice(&buf[20..30]);
-                                    let _ = general.send_to(&follow, (addr.ip(), 320));
-                                }
-                            }
-                        }
+                    while let Ok((n, addr)) = general.recv_from(&mut buf) {
+                        respond(&buf[..n], addr.ip(), clock.now_ns());
                     }
-                    thread::sleep(Duration::from_millis(2));
+                    // Block on the event port so a request's receipt time is taken when it
+                    // arrives; a polling delay here becomes jitter in the receiver's clock.
+                    let wait = next_sync.saturating_duration_since(Instant::now());
+                    let _ = event.set_read_timeout(Some(wait.clamp(
+                        Duration::from_millis(1),
+                        Duration::from_millis(10),
+                    )));
+                    if let Ok((n, addr)) = event.recv_from(&mut buf) {
+                        let received = clock.now_ns();
+                        respond(&buf[..n], addr.ip(), received);
+                    }
                 }
             })?;
         Ok(Self {
