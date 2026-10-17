@@ -336,6 +336,7 @@ fn capture(
         chunk,
         2,
     )?;
+    let mut servo = crate::drift::Servo::new(state.lock().unwrap().target, stream_rate);
     let mut inputs = [VecDeque::<f32>::new(), VecDeque::<f32>::new()];
     let mut input_times = VecDeque::new();
     unsafe { client.Start() }?;
@@ -416,13 +417,9 @@ fn capture(
                     .map(|q| q.drain(..chunk).collect())
                     .collect();
                 input_times.drain(..chunk);
-                let (have, target) = {
-                    let s = state.lock().unwrap();
-                    (s.frames.len(), s.target)
-                };
-                let correction =
-                    ((target as f64 - have as f64) / stream_rate as f64 * 0.01).clamp(-0.0005, 0.0005);
-                resampler.set_resample_ratio_relative(1.0 + correction, true)?;
+                let have = state.lock().unwrap().frames.len();
+                let ratio = servo.update(have, chunk as f64 / rate as f64);
+                resampler.set_resample_ratio_relative(ratio, true)?;
                 let output = resampler.process(&input, None)?;
                 let delay = resampler.output_delay() as u64 * 1_000_000_000 / stream_rate as u64;
                 let mut shared = state.lock().unwrap();

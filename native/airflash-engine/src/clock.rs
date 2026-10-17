@@ -32,7 +32,10 @@ impl Clock {
         }
     }
     pub fn now_ns(&self) -> u64 {
-        self.epoch_ns + self.origin.elapsed().as_nanos() as u64
+        self.at_ns(Instant::now())
+    }
+    pub fn at_ns(&self, instant: Instant) -> u64 {
+        self.epoch_ns + instant.saturating_duration_since(self.origin).as_nanos() as u64
     }
 }
 fn header(kind: u8, len: usize, clock: u64, seq: u16, flags: u16, interval: i8) -> Vec<u8> {
@@ -198,5 +201,12 @@ mod tests {
         assert_eq!(f.len(), 96);
         assert_eq!(&f[34..44], &[0, 0, 0, 0, 0, 1, 13, 251, 56, 210]);
         assert_eq!(announce(id, 0, 0).len(), 76);
+    }
+    #[test]
+    fn scheduled_instants_map_without_wake_up_jitter() {
+        let clock = Clock::new();
+        let scheduled = clock.origin + Duration::from_millis(250);
+        assert_eq!(clock.at_ns(scheduled) - clock.at_ns(clock.origin), 250_000_000);
+        assert!(clock.now_ns() >= clock.at_ns(clock.origin));
     }
 }

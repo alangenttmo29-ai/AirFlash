@@ -622,9 +622,11 @@ pub fn probe_with_controls(
                 );
             }
             if now >= next_sync {
+                // Anchor the next RTP timestamp to its scheduled media time, not to when this
+                // loop woke up; wake-up jitter would otherwise move the receiver's timeline.
+                let media_ns = clock.at_ns(schedule.deadline());
                 for m in &mut members {
-                    m.media
-                        .sync(clock.now_ns(), clock_id, latency, packets == 0);
+                    m.media.sync(media_ns, clock_id, latency, packets == 0);
                 }
                 next_sync = now + Duration::from_millis(100);
             }

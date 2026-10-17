@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod clock;
 pub mod crypto;
+pub mod drift;
 pub mod equalizer;
 pub mod rtp;
 pub mod rtsp;
