@@ -46,7 +46,72 @@ pub struct Metrics {
     pub last_audio_qpc_ns: u64,
     pub input_rate: u32,
 }
+/// Opt-in diagnostic: AIRFLASH_PCM_DUMP=<path prefix> records the first 30 s of the raw
+/// capture, the resampler output and the sent PCM so sender-side artifacts can be isolated.
+struct Dump {
+    prefix: std::path::PathBuf,
+    input_rate: u32,
+    stream_rate: u32,
+    captured: Vec<f32>,
+    resampled: Vec<f32>,
+    sent: Vec<i16>,
+    buffers: u64,
+    silent_buffers: u64,
+    timestamp_errors: u64,
+    discontinuities: Vec<u64>,
+    buffer_frames_min: u32,
+    buffer_frames_max: u32,
+}
+impl Dump {
+    fn from_env(input_rate: u32, stream_rate: u32) -> Option<Self> {
+        let prefix = std::env::var_os("AIRFLASH_PCM_DUMP")?;
+        Some(Self {
+            prefix: prefix.into(),
+            input_rate,
+            stream_rate,
+            captured: Vec::new(),
+            resampled: Vec::new(),
+            sent: Vec::new(),
+            buffers: 0,
+            silent_buffers: 0,
+            timestamp_errors: 0,
+            discontinuities: Vec::new(),
+            buffer_frames_min: u32::MAX,
+            buffer_frames_max: 0,
+        })
+    }
+    fn room(&self, len: usize, rate: u32) -> bool {
+        len < rate as usize * 2 * 30
+    }
+    fn write(&self) -> Result<()> {
+        let file = |suffix: &str| {
+            let mut name = self.prefix.clone().into_os_string();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        };
+        if let Some(parent) = file("").parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let float = |rate| hound::WavSpec { channels: 2, sample_rate: rate, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        for (suffix, rate, samples) in [("-capture.wav", self.input_rate, &self.captured), ("-resampled.wav", self.stream_rate, &self.resampled)] {
+            let mut writer = hound::WavWriter::create(file(suffix), float(rate))?;
+            for v in samples { writer.write_sample(*v)?; }
+            writer.finalize()?;
+        }
+        let mut writer = hound::WavWriter::create(file("-sent.wav"), hound::WavSpec { channels: 2, sample_rate: self.stream_rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int })?;
+        for v in &self.sent { writer.write_sample(*v)?; }
+        writer.finalize()?;
+        std::fs::write(file("-stats.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "input_rate": self.input_rate, "stream_rate": self.stream_rate, "wasapi_buffers": self.buffers,
+            "silent_buffers": self.silent_buffers, "timestamp_errors": self.timestamp_errors,
+            "buffer_frames_min": self.buffer_frames_min, "buffer_frames_max": self.buffer_frames_max,
+            "discontinuity_capture_frames": self.discontinuities,
+        }))?)?;
+        Ok(())
+    }
+}
 struct State {
+    dump: Option<Dump>,
     equalizer: crate::equalizer::Processor,
     frames: VecDeque<Frame>,
     capacity: usize,
@@ -75,6 +140,7 @@ impl Loopback {
         let capacity = rate as usize * 60 / 1000;
         let target = rate as usize * 20 / 1000;
         let state = Arc::new(Mutex::new(State {
+            dump: None,
             equalizer: crate::equalizer::Processor::new(equalizer.initial(), rate),
             frames: VecDeque::with_capacity(capacity),
             capacity,
@@ -156,6 +222,9 @@ impl Loopback {
         if underrun {
             s.metrics.underrun_packets += 1;
         }
+        if let Some(dump) = s.dump.as_mut().filter(|d| d.room(d.sent.len(), d.stream_rate)) {
+            dump.sent.extend(out.chunks_exact(2).map(|b| i16::from_be_bytes([b[0], b[1]])));
+        }
         Ok((out, marker))
     }
     /// Restore the capture queue to its normal target after a scheduler stall.
@@ -181,6 +250,9 @@ impl Drop for Loopback {
         self.stop.store(true, Ordering::Release);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
+        }
+        if let Some(dump) = self.state.lock().unwrap().dump.take() {
+            let _ = dump.write();
         }
     }
 }
@@ -341,7 +413,12 @@ fn capture(
     let mut input_times = VecDeque::new();
     unsafe { client.Start() }?;
     let _audio = AudioGuard(client);
-    state.lock().unwrap().metrics.input_rate = rate;
+    {
+        let mut s = state.lock().unwrap();
+        s.metrics.input_rate = rate;
+        s.dump = Dump::from_env(rate, stream_rate);
+    }
+    let mut captured_frames = 0u64;
     let _ = ready.send(Ok(()));
     let mut last_packet = Instant::now();
     while !stop.load(Ordering::Acquire) {
@@ -370,6 +447,16 @@ fn capture(
             } else {
                 qpc * 100
             };
+            if let Some(dump) = state.lock().unwrap().dump.as_mut() {
+                dump.buffers += 1;
+                dump.silent_buffers += u64::from(silent);
+                dump.timestamp_errors += u64::from(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0);
+                dump.buffer_frames_min = dump.buffer_frames_min.min(frames);
+                dump.buffer_frames_max = dump.buffer_frames_max.max(frames);
+                if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && dump.discontinuities.len() < 10_000 {
+                    dump.discontinuities.push(captured_frames);
+                }
+            }
             if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
                 inputs[0].clear();
                 inputs[1].clear();
@@ -409,7 +496,15 @@ fn capture(
             }
             unsafe { reader.ReleaseBuffer(frames) }?;
             last_packet = Instant::now();
-            state.lock().unwrap().metrics.capture_frames += frames as u64;
+            {
+                let mut s = state.lock().unwrap();
+                s.metrics.capture_frames += frames as u64;
+                if let Some(dump) = s.dump.as_mut().filter(|d| d.room(d.captured.len(), d.input_rate)) {
+                    let start = inputs[0].len() - frames as usize;
+                    dump.captured.extend(inputs[0].range(start..).zip(inputs[1].range(start..)).flat_map(|(l, r)| [*l, *r]));
+                }
+            }
+            captured_frames += frames as u64;
             while inputs[0].len() >= chunk {
                 let start = input_times[0];
                 let input: Vec<Vec<f32>> = inputs
@@ -423,6 +518,9 @@ fn capture(
                 let output = resampler.process(&input, None)?;
                 let delay = resampler.output_delay() as u64 * 1_000_000_000 / stream_rate as u64;
                 let mut shared = state.lock().unwrap();
+                if let Some(dump) = shared.dump.as_mut().filter(|d| d.room(d.resampled.len(), d.stream_rate)) {
+                    dump.resampled.extend(output[0].iter().zip(&output[1]).flat_map(|(l, r)| [*l, *r]));
+                }
                 for (i, (&left, &right)) in output[0].iter().zip(&output[1]).enumerate() {
                     shared.push_frame(Frame {
                         left,
@@ -493,6 +591,7 @@ mod tests {
         let equalizer_control = crate::equalizer::Control::new(crate::equalizer::Settings::default(), crate::rtp::RATE).unwrap();
         Loopback {
             state: Arc::new(Mutex::new(State {
+                dump: None,
                 equalizer: crate::equalizer::Processor::new(equalizer_control.initial(), crate::rtp::RATE),
                 frames: VecDeque::new(),
                 capacity: CAPACITY,
